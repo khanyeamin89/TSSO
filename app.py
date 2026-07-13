@@ -36,6 +36,7 @@ import difflib
 import io
 import os
 import re
+import time
 import uuid
 import streamlit as st
 import streamlit.components.v1 as components
@@ -57,6 +58,9 @@ CHUNK_SIZE_PAGES = 3   # pages per chunk
 CHUNK_STRIDE_PAGES = 2  # overlap of 1 page between consecutive chunks
 TOP_K_CHUNKS = 12       # how many chunks to retrieve per question
 MIN_SIMILARITY = 0.03   # below this combined score, a chunk is too weak to use
+
+MAX_API_RETRIES = 3          # attempts for transient Gemini errors (503/429/500...)
+RETRY_BACKOFF_SECONDS = 2    # doubles each retry: 2s, 4s, ...
 
 SUPABASE_TABLE = "qa_chat_messages"  # see supabase_schema.sql
 
@@ -183,14 +187,22 @@ def correct_query(query: str, vocabulary: set) -> tuple[str, bool]:
     """Best-effort spelling correction: for each word in the query that
     ISN'T in the document's own vocabulary, snap it to the closest word
     that IS (via fuzzy string matching), if one is close enough. Returns
-    (corrected_query, was_anything_changed)."""
+    (corrected_query, was_anything_changed).
+
+    Deliberately conservative: short words (e.g. transliterated Bangla like
+    "kore", "jodi") are left alone, and a candidate must start with the same
+    letter as the original word, since real typos almost never change the
+    first letter -- this avoids "correcting" a non-English word into an
+    unrelated English one that merely looks similar.
+    """
     tokens = query.split()
     changed = False
     for idx, tok in enumerate(tokens):
         stripped = re.sub(r"[^A-Za-z]", "", tok).lower()
-        if len(stripped) < 4 or stripped in vocabulary:
+        if len(stripped) < 5 or stripped in vocabulary:
             continue
-        match = difflib.get_close_matches(stripped, vocabulary, n=1, cutoff=0.75)
+        same_start = {w for w in vocabulary if w[0] == stripped[0]}
+        match = difflib.get_close_matches(stripped, same_start, n=1, cutoff=0.82)
         if match and match[0] != stripped:
             tokens[idx] = match[0]
             changed = True
@@ -220,6 +232,14 @@ def retrieve_chunks(
     # de-dupe overlapping pages, then sort by first page number
     selected.sort(key=lambda c: c["pages"][0])
     return selected
+
+
+def is_transient_api_error(e: Exception) -> bool:
+    """True for errors worth retrying automatically: server overload (503),
+    rate limiting (429), or generic backend hiccups (500) -- as opposed to
+    e.g. a bad API key, which retrying won't fix."""
+    msg = str(e)
+    return any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL"))
 
 
 def get_api_key() -> str | None:
@@ -546,26 +566,51 @@ if question:
         st.caption(f"Searched pages: {pages_used[0]}-{pages_used[-1]} ({len(retrieved)} excerpts retrieved)")
         placeholder = st.empty()
         answer_text = ""
-        try:
-            stream = client.models.generate_content_stream(
-                model=MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_PROMPT,
-                    max_output_tokens=50000,
-                ),
-            )
-            for chunk in stream:
-                if chunk.text:
-                    answer_text += chunk.text
-                    placeholder.markdown(answer_text + "▌")
-            # Streaming is done -- clear the raw placeholder and render the
-            # final answer properly (turns any ```mermaid``` / ```chart```
-            # blocks into an actual diagram or bar chart).
-            placeholder.empty()
-            render_answer(answer_text)
-        except Exception as e:
-            answer_text = f"Error calling the Gemini API: {e}"
+        last_error = None
+
+        for attempt in range(1, MAX_API_RETRIES + 1):
+            answer_text = ""
+            try:
+                stream = client.models.generate_content_stream(
+                    model=MODEL,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        max_output_tokens=50000,
+                    ),
+                )
+                for chunk in stream:
+                    if chunk.text:
+                        answer_text += chunk.text
+                        placeholder.markdown(answer_text + "▌")
+                # Streaming is done -- clear the raw placeholder and render the
+                # final answer properly (turns any ```mermaid``` / ```chart```
+                # blocks into an actual diagram or bar chart).
+                placeholder.empty()
+                render_answer(answer_text)
+                last_error = None
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_API_RETRIES and is_transient_api_error(e):
+                    wait_seconds = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                    placeholder.info(
+                        f"Gemini is under high demand right now -- retrying in "
+                        f"{wait_seconds}s (attempt {attempt}/{MAX_API_RETRIES})..."
+                    )
+                    time.sleep(wait_seconds)
+                else:
+                    break
+
+        if last_error is not None:
+            if is_transient_api_error(last_error):
+                answer_text = (
+                    "Sorry, the Gemini API is temporarily overloaded and didn't "
+                    "respond after a few tries. This is usually short-lived -- "
+                    "please try asking again in a moment."
+                )
+            else:
+                answer_text = f"Error calling the Gemini API: {last_error}"
             placeholder.error(answer_text)
 
     st.session_state["chat_history"].append({"role": "user", "content": question})
