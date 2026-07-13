@@ -65,7 +65,7 @@ CHUNK_STRIDE_PAGES = 2  # overlap of 1 page between consecutive chunks
 # it to generate before you see the full answer.
 TOP_K_CHUNKS = 8         # was 12 -- smaller prompt, faster first token
 MIN_SIMILARITY = 0.03    # below this combined score, a chunk is too weak to use
-MAX_OUTPUT_TOKENS = 4096 # was 50000 -- answers are a few paragraphs, not a novel
+MAX_OUTPUT_TOKENS = 8192 # was 4096 -- 4096 was cutting off longer/detailed answers
 
 # Hard cap on the RETRIEVED EXCERPT text sent per request, regardless of how
 # many chunks TOP_K_CHUNKS picks. Some page ranges (dense tables, protocol
@@ -98,8 +98,8 @@ FEEDBACK_EXAMPLES_K = 2                   # how many past 👍 answers to reuse 
 # a different (open-weights) model -- flagged clearly in the UI when used.
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_TOP_K_CHUNKS = 3
-GROQ_MAX_EXCERPT_TOKENS = 30000
-GROQ_MAX_OUTPUT_TOKENS = 20000
+GROQ_MAX_EXCERPT_TOKENS = 3000
+GROQ_MAX_OUTPUT_TOKENS = 2048
 GROQ_MAX_RETRIES = 2
 
 SYSTEM_PROMPT = f"""You are a careful technical assistant answering questions \
@@ -836,7 +836,12 @@ if question:
         st.markdown(question)
 
     index = build_index()
+    forced_search_query = st.session_state.pop("force_search_query", None)
     search_query, was_corrected = correct_query(question, index["vocabulary"])
+    if forced_search_query:
+        search_query, was_corrected = forced_search_query, False
+    else:
+        st.session_state["last_search_query"] = search_query
     retrieved = retrieve_chunks(index, search_query)
 
     no_excerpts = not retrieved
@@ -879,6 +884,7 @@ if question:
 
         for attempt in range(1, MAX_API_RETRIES + 1):
             answer_text = ""
+            was_truncated = False
             try:
                 stream = client.models.generate_content_stream(
                     model=active_model,
@@ -889,15 +895,37 @@ if question:
                         thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
                     ),
                 )
+                last_chunk = None
                 for chunk in stream:
+                    last_chunk = chunk
                     if chunk.text:
                         answer_text += chunk.text
                         placeholder.markdown(answer_text + "▌")
+                # Detect truncation: the model was cut off mid-answer by the
+                # max_output_tokens cap rather than finishing naturally.
+                if last_chunk is not None and getattr(last_chunk, "candidates", None):
+                    finish_reason = str(getattr(last_chunk.candidates[0], "finish_reason", ""))
+                    was_truncated = "MAX_TOKENS" in finish_reason
                 # Streaming is done -- clear the raw placeholder and render the
                 # final answer properly (turns any ```mermaid``` / ```chart```
                 # blocks into an actual diagram or bar chart).
                 placeholder.empty()
                 render_answer(answer_text)
+                if was_truncated:
+                    st.warning(
+                        "⚠️ This answer was cut off (hit the length limit)."
+                    )
+                    cont_key = f"cont_{session_id}_{len(st.session_state['chat_history'])}"
+                    if st.button("▶️ Continue this answer", key=cont_key):
+                        st.session_state["retry_question"] = (
+                            "Continue your previous answer exactly where it left off. "
+                            "Do not repeat anything you already said, and do not "
+                            "restart the explanation."
+                        )
+                        st.session_state["force_search_query"] = st.session_state.get(
+                            "last_search_query", question
+                        )
+                        st.rerun()
                 last_error = None
                 break
             except Exception as e:
