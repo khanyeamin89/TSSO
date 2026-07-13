@@ -28,7 +28,7 @@ from google.genai import types
 # Configuration
 # --------------------------------------------------------------------------
 
-MODEL = "gemini-2.5-flash"  # free-tier eligible, 1M-token context window
+MODEL = "gemini-3.5-flash"  # current GA model, free-tier eligible, 1M-token context window
 DOCUMENT_PATH = os.path.join(os.path.dirname(__file__), "document.txt")
 DOCUMENT_TITLE = "RPR.0534.1.0.BN.DZ0001 -- Technical Specification of Safe Operation of Rooppur NPP Unit 1 (Version 2)"
 
