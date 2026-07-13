@@ -43,8 +43,20 @@ import streamlit.components.v1 as components
 import pandas as pd
 from google import genai
 from google.genai import types
-from groq import Groq
-from mistralai import Mistral
+
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except Exception:
+    Groq = None
+    GROQ_AVAILABLE = False
+
+try:
+    from mistralai import Mistral
+    MISTRAL_AVAILABLE = True
+except Exception:
+    Mistral = None
+    MISTRAL_AVAILABLE = False
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -776,43 +788,61 @@ with st.sidebar:
     else:
         st.success("API key loaded.")
 
-    groq_api_key = get_groq_api_key()
-    with st.expander("⚡ Groq fallback (optional)", expanded=not groq_api_key):
-        st.caption(
-            "If Gemini hits a rate limit, the app automatically retries the "
-            "same question through Groq (free, no card, much higher "
-            "requests/minute) instead of just failing. Answers via fallback "
-            "are clearly labeled, and Groq uses a different (open-weights) "
-            "model, so citation precision may vary slightly."
-        )
-        if groq_api_key:
-            st.success("Groq fallback is active.")
-        else:
-            st.markdown("Get a free key at [console.groq.com/keys](https://console.groq.com/keys).")
-            manual_groq_key = st.text_input("Enter your Groq API key", type="password", key="groq_key_input")
-            if manual_groq_key:
-                st.session_state["manual_groq_key"] = manual_groq_key
-                groq_api_key = manual_groq_key
-
-    mistral_api_key = get_mistral_api_key()
-    with st.expander("🧠 Mistral fallback (optional, 3rd tier)", expanded=False):
-        st.caption(
-            "If BOTH Gemini and Groq fail, the app tries once more through "
-            "Mistral Large -- an independent free quota (real redundancy) "
-            "and generally stronger reasoning than Groq's open-weights model "
-            "for a dense technical document. Its free tier is very slow "
-            "per-minute, which is fine since it's a last resort."
-        )
-        if mistral_api_key:
-            st.success("Mistral fallback is active.")
-        else:
-            st.markdown("Get a free key at [console.mistral.ai](https://console.mistral.ai/).")
-            manual_mistral_key = st.text_input(
-                "Enter your Mistral API key", type="password", key="mistral_key_input"
+    groq_api_key = get_groq_api_key() if GROQ_AVAILABLE else None
+    if not GROQ_AVAILABLE:
+        with st.expander("⚡ Groq fallback (unavailable)", expanded=False):
+            st.caption(
+                "The `groq` package isn't installed in this environment, so "
+                "this fallback tier is disabled -- the app still runs fine "
+                "on Gemini alone. Add `groq` to requirements.txt and redeploy "
+                "to enable it."
             )
-            if manual_mistral_key:
-                st.session_state["manual_mistral_key"] = manual_mistral_key
-                mistral_api_key = manual_mistral_key
+    else:
+        with st.expander("⚡ Groq fallback (optional)", expanded=not groq_api_key):
+            st.caption(
+                "If Gemini hits a rate limit, the app automatically retries the "
+                "same question through Groq (free, no card, much higher "
+                "requests/minute) instead of just failing. Answers via fallback "
+                "are clearly labeled, and Groq uses a different (open-weights) "
+                "model, so citation precision may vary slightly."
+            )
+            if groq_api_key:
+                st.success("Groq fallback is active.")
+            else:
+                st.markdown("Get a free key at [console.groq.com/keys](https://console.groq.com/keys).")
+                manual_groq_key = st.text_input("Enter your Groq API key", type="password", key="groq_key_input")
+                if manual_groq_key:
+                    st.session_state["manual_groq_key"] = manual_groq_key
+                    groq_api_key = manual_groq_key
+
+    mistral_api_key = get_mistral_api_key() if MISTRAL_AVAILABLE else None
+    if not MISTRAL_AVAILABLE:
+        with st.expander("🧠 Mistral fallback (unavailable)", expanded=False):
+            st.caption(
+                "The `mistralai` package isn't installed in this environment "
+                "(it also needs Python 3.10+), so this fallback tier is "
+                "disabled -- the app still runs fine without it. Add "
+                "`mistralai` to requirements.txt and redeploy to enable it."
+            )
+    else:
+        with st.expander("🧠 Mistral fallback (optional, 3rd tier)", expanded=False):
+            st.caption(
+                "If BOTH Gemini and Groq fail, the app tries once more through "
+                "Mistral Large -- an independent free quota (real redundancy) "
+                "and generally stronger reasoning than Groq's open-weights model "
+                "for a dense technical document. Its free tier is very slow "
+                "per-minute, which is fine since it's a last resort."
+            )
+            if mistral_api_key:
+                st.success("Mistral fallback is active.")
+            else:
+                st.markdown("Get a free key at [console.mistral.ai](https://console.mistral.ai/).")
+                manual_mistral_key = st.text_input(
+                    "Enter your Mistral API key", type="password", key="mistral_key_input"
+                )
+                if manual_mistral_key:
+                    st.session_state["manual_mistral_key"] = manual_mistral_key
+                    mistral_api_key = manual_mistral_key
 
     st.divider()
     st.session_state["fast_mode"] = st.toggle(
