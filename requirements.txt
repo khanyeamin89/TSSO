@@ -1,7 +1,7 @@
 streamlit>=1.38
 google-genai>=1.0
 groq>=0.11
-mistralai>=1.0
+mistralai
 pypdf>=5.0
 scikit-learn>=1.4
 pandas>=2.0
