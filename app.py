@@ -32,6 +32,7 @@ current browser tab.
 Get a free API key (no credit card) at https://aistudio.google.com/app/apikey
 """
 
+import difflib
 import io
 import os
 import re
@@ -55,6 +56,7 @@ DOCUMENT_TITLE = "RPR.0534.1.0.BN.DZ0001 -- Technical Specification of Safe Oper
 CHUNK_SIZE_PAGES = 3   # pages per chunk
 CHUNK_STRIDE_PAGES = 2  # overlap of 1 page between consecutive chunks
 TOP_K_CHUNKS = 12       # how many chunks to retrieve per question
+MIN_SIMILARITY = 0.03   # below this combined score, a chunk is too weak to use
 
 SUPABASE_TABLE = "qa_chat_messages"  # see supabase_schema.sql
 
@@ -74,6 +76,17 @@ Rules:
   user can try rephrasing the question to help retrieval find it).
 - Be precise with numbers, units, and parameter names -- this is a nuclear
   safety document and accuracy matters.
+
+Language:
+- Reply in the same language the user asked in.
+- If the question is in Bangla (Bengali script or Banglish/romanized
+  Bangla), answer in natural mixed Bangla-English (Bangla বাক্যগঠন দিয়ে
+  ব্যাখ্যা করবে) -- keep technical terms, units, numbers, and page
+  citations in English (e.g. "pressure", "coolant", "p. 37"), since
+  those don't have natural Bangla equivalents in this document, but
+  write the surrounding explanation in Bangla, the way a Bangladeshi
+  engineer would naturally speak/write about this topic.
+- If the question is in English, answer in English as usual.
 
 How to write the answer (plain-language style):
 - Explain things in your OWN words, the way you'd explain it to an
@@ -114,8 +127,13 @@ Diagrams and charts (use only when they genuinely help):
 
 @st.cache_resource(show_spinner="Loading and indexing document...")
 def build_index():
-    """Load document.txt, split into overlapping page-chunks, and build a
-    TF-IDF index over them. Runs once per server process."""
+    """Load document.txt, split into overlapping page-chunks, and build TWO
+    TF-IDF indexes over them:
+    - a word-level index (precise, but misses on misspelled words)
+    - a character n-gram index (fuzzy -- a misspelled word still shares
+      most of its letter sequences with the correct one, so this finds
+      the right pages even without correcting the query).
+    Runs once per server process."""
     with open(DOCUMENT_PATH, "r", encoding="utf-8") as f:
         text = f.read()
 
@@ -137,24 +155,68 @@ def build_index():
             break
         i += CHUNK_STRIDE_PAGES
 
+    chunk_texts = [c["text"] for c in chunks]
+
     vectorizer = TfidfVectorizer(stop_words="english", max_features=50000)
-    matrix = vectorizer.fit_transform([c["text"] for c in chunks])
+    matrix = vectorizer.fit_transform(chunk_texts)
+
+    char_vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), max_features=50000)
+    char_matrix = char_vectorizer.fit_transform(chunk_texts)
+
+    # Vocabulary of the document's own words, used to spell-correct queries
+    # against terms that actually appear in the document (rather than a
+    # generic English dictionary, which wouldn't know domain terms).
+    vocabulary = {w for w in vectorizer.vocabulary_.keys() if len(w) >= 4}
 
     return {
         "chunks": chunks,
         "vectorizer": vectorizer,
         "matrix": matrix,
+        "char_vectorizer": char_vectorizer,
+        "char_matrix": char_matrix,
+        "vocabulary": vocabulary,
         "num_pages": len(pages),
     }
 
 
-def retrieve_chunks(index: dict, query: str, top_k: int = TOP_K_CHUNKS):
+def correct_query(query: str, vocabulary: set) -> tuple[str, bool]:
+    """Best-effort spelling correction: for each word in the query that
+    ISN'T in the document's own vocabulary, snap it to the closest word
+    that IS (via fuzzy string matching), if one is close enough. Returns
+    (corrected_query, was_anything_changed)."""
+    tokens = query.split()
+    changed = False
+    for idx, tok in enumerate(tokens):
+        stripped = re.sub(r"[^A-Za-z]", "", tok).lower()
+        if len(stripped) < 4 or stripped in vocabulary:
+            continue
+        match = difflib.get_close_matches(stripped, vocabulary, n=1, cutoff=0.75)
+        if match and match[0] != stripped:
+            tokens[idx] = match[0]
+            changed = True
+    return " ".join(tokens), changed
+
+
+def retrieve_chunks(
+    index: dict,
+    query: str,
+    top_k: int = TOP_K_CHUNKS,
+    word_weight: float = 0.7,
+    char_weight: float = 0.3,
+):
     """Return the top_k chunks most relevant to the query, sorted back into
-    page order (so the excerpt reads coherently top-to-bottom)."""
-    qvec = index["vectorizer"].transform([query])
-    sims = cosine_similarity(qvec, index["matrix"])[0]
-    top_idx = sims.argsort()[::-1][:top_k]
-    selected = [index["chunks"][i] for i in top_idx if sims[i] > 0]
+    page order (so the excerpt reads coherently top-to-bottom). Combines
+    word-level similarity (precise) with character n-gram similarity
+    (typo-tolerant) so a misspelled query word still surfaces the right
+    pages even if it wasn't corrected."""
+    word_sims = cosine_similarity(index["vectorizer"].transform([query]), index["matrix"])[0]
+    char_sims = cosine_similarity(
+        index["char_vectorizer"].transform([query]), index["char_matrix"]
+    )[0]
+    combined = word_weight * word_sims + char_weight * char_sims
+
+    top_idx = combined.argsort()[::-1][:top_k]
+    selected = [index["chunks"][i] for i in top_idx if combined[i] > MIN_SIMILARITY]
     # de-dupe overlapping pages, then sort by first page number
     selected.sort(key=lambda c: c["pages"][0])
     return selected
@@ -455,7 +517,8 @@ if question:
         st.markdown(question)
 
     index = build_index()
-    retrieved = retrieve_chunks(index, question)
+    search_query, was_corrected = correct_query(question, index["vocabulary"])
+    retrieved = retrieve_chunks(index, search_query)
 
     if not retrieved:
         with st.chat_message("assistant"):
@@ -478,6 +541,8 @@ if question:
     contents = build_contents(excerpt_text, st.session_state["chat_history"], question)
 
     with st.chat_message("assistant"):
+        if was_corrected:
+            st.caption(f"Also searched for: \"{search_query}\" (in case of a typo)")
         st.caption(f"Searched pages: {pages_used[0]}-{pages_used[-1]} ({len(retrieved)} excerpts retrieved)")
         placeholder = st.empty()
         answer_text = ""
