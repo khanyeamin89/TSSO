@@ -50,19 +50,29 @@ from sklearn.metrics.pairwise import cosine_similarity
 # Configuration
 # --------------------------------------------------------------------------
 
-MODEL = "gemini-3.5-flash"  # current GA model, free-tier eligible
+MODEL = "gemini-3.5-flash"          # accurate mode -- current GA model, free-tier eligible
+FAST_MODEL = "gemini-3.1-flash-lite"  # fast mode -- Google's low-latency, high-throughput tier
+
 DOCUMENT_PATH = os.path.join(os.path.dirname(__file__), "document.txt")
 DOCUMENT_TITLE = "RPR.0534.1.0.BN.DZ0001 -- Technical Specification of Safe Operation of Rooppur NPP Unit 1 (Version 2)"
 
 CHUNK_SIZE_PAGES = 3   # pages per chunk
 CHUNK_STRIDE_PAGES = 2  # overlap of 1 page between consecutive chunks
-TOP_K_CHUNKS = 12       # how many chunks to retrieve per question
-MIN_SIMILARITY = 0.03   # below this combined score, a chunk is too weak to use
+
+# Fewer/more chunks and a shorter reply cap trade a little context for a lot
+# of latency -- smaller prompts reach the model faster and there's less for
+# it to generate before you see the full answer.
+TOP_K_CHUNKS = 8         # was 12 -- smaller prompt, faster first token
+MIN_SIMILARITY = 0.03    # below this combined score, a chunk is too weak to use
+MAX_OUTPUT_TOKENS = 4096 # was 50000 -- answers are a few paragraphs, not a novel
+THINKING_LEVEL = "low"   # Gemini 3.x "thinking" budget: low = fast, minimal deliberation
 
 MAX_API_RETRIES = 3          # attempts for transient Gemini errors (503/429/500...)
 RETRY_BACKOFF_SECONDS = 2    # doubles each retry: 2s, 4s, ...
 
-SUPABASE_TABLE = "qa_chat_messages"  # see supabase_schema.sql
+SUPABASE_TABLE = "qa_chat_messages"       # see supabase_schema.sql
+SUPABASE_FEEDBACK_TABLE = "qa_feedback"   # thumbs-up/down learning signal, see supabase_schema.sql
+FEEDBACK_EXAMPLES_K = 2                   # how many past 👍 answers to reuse as style/accuracy examples
 
 SYSTEM_PROMPT = f"""You are a careful technical assistant answering questions \
 about a single reference document: {DOCUMENT_TITLE}.
@@ -71,15 +81,39 @@ You are given a set of EXCERPTS retrieved from the document (not the whole
 document) -- they are the pages judged most relevant to the question.
 
 Rules:
-- Answer ONLY using the excerpts provided. Do not use outside knowledge
-  about nuclear plants, Rooppur, or regulations in general.
+- PREFER the excerpts over everything else. For anything the excerpts do
+  answer, answer ONLY from them.
 - Each excerpt is labeled with page markers like "[PAGE 12]". Cite the
   page number(s) you drew the answer from, e.g. "(p. 37)" or "(pp. 40-41)".
-- If the excerpts don't contain the answer, say so plainly -- don't guess,
-  and mention that the relevant section may not have been retrieved (the
-  user can try rephrasing the question to help retrieval find it).
 - Be precise with numbers, units, and parameter names -- this is a nuclear
-  safety document and accuracy matters.
+  safety document and accuracy matters. Never invent a page number, a
+  value, or a citation.
+
+Outside knowledge (clearly labeled, used only when the document doesn't cover it):
+- If the excerpts don't contain the answer, but you can reasonably answer
+  from general nuclear-engineering, regulatory, or technical knowledge --
+  or by logically connecting/mapping something the excerpts DO say to what
+  is being asked -- you may do so, but you MUST clearly separate it out
+  under its own heading: "🌐 Outside information (not from this document)".
+- Never blend outside knowledge into a document-cited sentence without that
+  label. The reader must always be able to tell, at a glance, which part
+  of your answer came from RPR.0534.1.0.BN.DZ0001 and which came from
+  general knowledge or inference.
+- Under that heading, briefly say WHY you believe it (general practice,
+  standard nuclear engineering convention, inference from a related rule
+  in the excerpts, etc.), and note that it should be verified against the
+  authoritative document/standard before being relied on operationally.
+- If you have neither a document answer nor a credible outside answer, say
+  so plainly rather than guessing, and suggest the user rephrase the
+  question to help retrieval find the right pages.
+
+Learning from past helpful answers:
+- You may be given a few "Previously confirmed helpful" Q&A examples --
+  real answers to similar past questions that a user marked 👍. Treat them
+  as a guide to preferred phrasing, structure, and level of detail, and as
+  a consistency check (don't contradict a previously-confirmed answer
+  without good reason). Never treat them as a substitute for the actual
+  excerpts -- if they conflict with the current excerpts, the excerpts win.
 
 Language:
 - Reply in the same language the user asked in.
@@ -358,7 +392,76 @@ def list_past_sessions(client, limit: int = 20) -> list[dict]:
         return []
 
 
-def build_contents(excerpt_text: str, chat_history: list[dict], question: str) -> list[dict]:
+def save_feedback(
+    client, session_id: str, question: str, answer: str, pages_used: list[int], rating: str
+) -> None:
+    """Store a 👍/👎 rating for a Q&A pair. This is the raw signal the
+    'learning' feature below reuses -- since the Gemini API can't be
+    fine-tuned per-user, we approximate learning by feeding well-rated
+    past answers back in as in-context examples for similar future
+    questions (see get_helpful_examples)."""
+    if client is None:
+        return
+    try:
+        client.table(SUPABASE_FEEDBACK_TABLE).insert(
+            {
+                "session_id": session_id,
+                "question": question,
+                "answer": answer,
+                "pages_used": pages_used,
+                "rating": rating,
+            }
+        ).execute()
+    except Exception:
+        pass
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _load_positive_feedback(_client) -> list[dict]:
+    """Pull all 👍-rated Q&A pairs (cached for 2 minutes so every question
+    doesn't re-hit Supabase). Underscore param tells st.cache_data not to
+    try to hash the (unhashable) Supabase client."""
+    if _client is None:
+        return []
+    try:
+        res = (
+            _client.table(SUPABASE_FEEDBACK_TABLE)
+            .select("question, answer")
+            .eq("rating", "up")
+            .order("created_at", desc=True)
+            .limit(300)
+            .execute()
+        )
+        return res.data
+    except Exception:
+        return []
+
+
+def get_helpful_examples(client, question: str, top_k: int = FEEDBACK_EXAMPLES_K) -> list[dict]:
+    """Find past 👍-rated Q&A pairs whose QUESTION is most similar to the
+    current one (simple TF-IDF over the small feedback set -- no need for
+    the full document index here). Returns the ones worth reusing as
+    examples, or [] if there's no feedback history yet / nothing close."""
+    examples = _load_positive_feedback(client)
+    if len(examples) < 1:
+        return []
+    try:
+        past_questions = [e["question"] for e in examples]
+        vec = TfidfVectorizer(stop_words="english")
+        matrix = vec.fit_transform(past_questions + [question])
+        sims = cosine_similarity(matrix[-1], matrix[:-1])[0]
+        ranked = sims.argsort()[::-1][:top_k]
+        return [examples[i] for i in ranked if sims[i] > 0.15]
+    except Exception:
+        return []
+
+
+def build_contents(
+    excerpt_text: str,
+    chat_history: list[dict],
+    question: str,
+    helpful_examples: list[dict] | None = None,
+) -> list[dict]:
     """Build the `contents` list for the API call. Unlike the whole-document
     approach, we send the (small) retrieved excerpt fresh with EVERY turn,
     since which excerpt is relevant changes per question."""
@@ -368,12 +471,23 @@ def build_contents(excerpt_text: str, chat_history: list[dict], question: str) -
         role = "model" if turn["role"] == "assistant" else "user"
         contents.append({"role": role, "parts": [{"text": turn["content"]}]})
 
+    examples_block = ""
+    if helpful_examples:
+        rendered = "\n\n".join(
+            f"Q: {e['question']}\nA: {e['answer']}" for e in helpful_examples
+        )
+        examples_block = (
+            "Previously confirmed helpful (👍) answers to similar questions -- "
+            "use these only as a style/consistency guide, the excerpts below "
+            f"are still the source of truth:\n\n{rendered}\n\n"
+        )
+
     contents.append(
         {
             "role": "user",
             "parts": [
                 {
-                    "text": f"Relevant excerpts from the document:\n\n{excerpt_text}\n\n"
+                    "text": f"{examples_block}Relevant excerpts from the document:\n\n{excerpt_text}\n\n"
                     f"Question: {question}"
                 }
             ],
@@ -446,6 +560,14 @@ def render_answer(text: str) -> None:
 st.set_page_config(page_title="Document Q&A -- RPR.0534.1.0.BN.DZ0001", page_icon="[Q&A]")
 st.title("Document Q&A")
 st.caption(DOCUMENT_TITLE)
+st.caption(
+    "Answers are grounded in the document and cite page numbers. When the "
+    "document doesn't cover something, I may add a clearly separate "
+    "\"🌐 Outside information\" section from general knowledge -- always "
+    "verify that part independently. Rate answers 👍/👎 so future similar "
+    "questions can reuse what worked."
+)
+
 
 supabase_client = get_supabase_client()
 
@@ -471,11 +593,23 @@ with st.sidebar:
         st.success("API key loaded.")
 
     st.divider()
+    st.session_state["fast_mode"] = st.toggle(
+        "⚡ Fast mode",
+        value=st.session_state.get("fast_mode", False),
+        help=(
+            f"Switches from {MODEL} to {FAST_MODEL}, Google's low-latency "
+            "tier. Answers arrive noticeably faster; for a document this "
+            "technical, keep it off when precision matters most."
+        ),
+    )
+
+    st.divider()
     index = build_index()
+    active_model_label = FAST_MODEL if st.session_state.get("fast_mode") else MODEL
     st.markdown(
         "**Model:** `{}`\n\n"
         "**Document:** {} pages, indexed into {} searchable chunks.".format(
-            MODEL, index["num_pages"], len(index["chunks"])
+            active_model_label, index["num_pages"], len(index["chunks"])
         )
     )
     st.caption(
@@ -559,30 +693,36 @@ if question:
     search_query, was_corrected = correct_query(question, index["vocabulary"])
     retrieved = retrieve_chunks(index, search_query)
 
-    if not retrieved:
-        with st.chat_message("assistant"):
-            answer_text = (
-                "I couldn't find any pages in the document that match this "
-                "question closely enough. Try rephrasing it or using terms "
-                "more likely to appear in the document."
-            )
-            st.markdown(answer_text)
-        st.session_state["chat_history"].append({"role": "user", "content": question})
-        st.session_state["chat_history"].append({"role": "assistant", "content": answer_text})
-        save_message_to_supabase(supabase_client, session_id, "user", question)
-        save_message_to_supabase(supabase_client, session_id, "assistant", answer_text)
-        st.stop()
+    no_excerpts = not retrieved
+    if no_excerpts:
+        excerpt_text = (
+            "(No document pages matched this question closely enough -- none "
+            "are included. If you can answer this from general knowledge, do "
+            "so under the '🌐 Outside information' heading as instructed; "
+            "otherwise say plainly that the document doesn't seem to cover it.)"
+        )
+        pages_used = []
+    else:
+        excerpt_text = "\n\n---\n\n".join(c["text"] for c in retrieved)
+        pages_used = sorted({p for c in retrieved for p in c["pages"]})
 
-    excerpt_text = "\n\n---\n\n".join(c["text"] for c in retrieved)
-    pages_used = sorted({p for c in retrieved for p in c["pages"]})
+    helpful_examples = get_helpful_examples(supabase_client, question)
 
+    active_model = FAST_MODEL if st.session_state.get("fast_mode") else MODEL
     client = genai.Client(api_key=api_key)
-    contents = build_contents(excerpt_text, st.session_state["chat_history"], question)
+    contents = build_contents(
+        excerpt_text, st.session_state["chat_history"], question, helpful_examples
+    )
 
     with st.chat_message("assistant"):
         if was_corrected:
             st.caption(f"Also searched for: \"{search_query}\" (in case of a typo)")
-        st.caption(f"Searched pages: {pages_used[0]}-{pages_used[-1]} ({len(retrieved)} excerpts retrieved)")
+        if no_excerpts:
+            st.caption("No matching pages found -- answering from outside knowledge only, if possible.")
+        else:
+            st.caption(f"Searched pages: {pages_used[0]}-{pages_used[-1]} ({len(retrieved)} excerpts retrieved)")
+        if helpful_examples:
+            st.caption(f"Reusing {len(helpful_examples)} previously 👍-rated similar answer(s) as a guide.")
         placeholder = st.empty()
         answer_text = ""
         last_error = None
@@ -591,11 +731,12 @@ if question:
             answer_text = ""
             try:
                 stream = client.models.generate_content_stream(
-                    model=MODEL,
+                    model=active_model,
                     contents=contents,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
-                        max_output_tokens=80000,
+                        max_output_tokens=MAX_OUTPUT_TOKENS,
+                        thinking_config=types.ThinkingConfig(thinking_level=THINKING_LEVEL),
                     ),
                 )
                 for chunk in stream:
@@ -631,6 +772,18 @@ if question:
             else:
                 answer_text = f"Error calling the Gemini API: {last_error}"
             placeholder.error(answer_text)
+
+        if last_error is None and not is_error_message(answer_text):
+            fb_col1, fb_col2, _ = st.columns([1, 1, 8])
+            fb_key_base = f"fb_{session_id}_{len(st.session_state['chat_history'])}"
+            with fb_col1:
+                if st.button("👍", key=f"{fb_key_base}_up"):
+                    save_feedback(supabase_client, session_id, question, answer_text, pages_used, "up")
+                    st.toast("Thanks -- I'll reuse this as an example for similar questions.")
+            with fb_col2:
+                if st.button("👎", key=f"{fb_key_base}_down"):
+                    save_feedback(supabase_client, session_id, question, answer_text, pages_used, "down")
+                    st.toast("Thanks -- noted, this one won't be reused.")
 
     st.session_state["chat_history"].append({"role": "user", "content": question})
     st.session_state["chat_history"].append({"role": "assistant", "content": answer_text})
