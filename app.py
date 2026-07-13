@@ -243,7 +243,7 @@ if question:
                 contents=contents,
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_PROMPT,
-                    max_output_tokens=2000,
+                    max_output_tokens=20000,
                 ),
             )
             for chunk in stream:
