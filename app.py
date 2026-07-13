@@ -65,6 +65,17 @@ CHUNK_STRIDE_PAGES = 2  # overlap of 1 page between consecutive chunks
 TOP_K_CHUNKS = 8         # was 12 -- smaller prompt, faster first token
 MIN_SIMILARITY = 0.03    # below this combined score, a chunk is too weak to use
 MAX_OUTPUT_TOKENS = 4096 # was 50000 -- answers are a few paragraphs, not a novel
+
+# Hard cap on the RETRIEVED EXCERPT text sent per request, regardless of how
+# many chunks TOP_K_CHUNKS picks. Some page ranges (dense tables, protocol
+# lists) are much heavier per-page than others, so chunk COUNT alone doesn't
+# bound token count -- this does. 80,000 tokens leaves comfortable headroom
+# under the free tier's 250,000 TPM quota once you add the system prompt,
+# chat history, and output tokens, which is what was tripping the
+# "high demand" retry loop. ~4 chars/token is a safe rough estimate for
+# English/technical text (real tokenizer isn't available client-side).
+MAX_EXCERPT_TOKENS = 80000
+CHARS_PER_TOKEN_ESTIMATE = 4
 THINKING_LEVEL = "low"   # Gemini 3.x "thinking" budget: low = fast, minimal deliberation
 
 MAX_API_RETRIES = 3          # attempts for transient Gemini errors (503/429/500...)
@@ -262,7 +273,23 @@ def retrieve_chunks(
     combined = word_weight * word_sims + char_weight * char_sims
 
     top_idx = combined.argsort()[::-1][:top_k]
-    selected = [index["chunks"][i] for i in top_idx if combined[i] > MIN_SIMILARITY]
+    ranked = [index["chunks"][i] for i in top_idx if combined[i] > MIN_SIMILARITY]
+
+    # Enforce the token budget: walk the list in relevance order (most
+    # relevant first) and keep adding chunks until the next one would push
+    # the estimated total over MAX_EXCERPT_TOKENS. Always keep at least the
+    # single best chunk, even if it alone is large, so a question never
+    # comes back completely empty-handed.
+    selected = []
+    budget_chars = MAX_EXCERPT_TOKENS * CHARS_PER_TOKEN_ESTIMATE
+    used_chars = 0
+    for chunk in ranked:
+        chunk_chars = len(chunk["text"])
+        if selected and used_chars + chunk_chars > budget_chars:
+            continue
+        selected.append(chunk)
+        used_chars += chunk_chars
+
     # de-dupe overlapping pages, then sort by first page number
     selected.sort(key=lambda c: c["pages"][0])
     return selected
@@ -720,7 +747,11 @@ if question:
         if no_excerpts:
             st.caption("No matching pages found -- answering from outside knowledge only, if possible.")
         else:
-            st.caption(f"Searched pages: {pages_used[0]}-{pages_used[-1]} ({len(retrieved)} excerpts retrieved)")
+            est_tokens = sum(len(c["text"]) for c in retrieved) // CHARS_PER_TOKEN_ESTIMATE
+            st.caption(
+                f"Searched pages: {pages_used[0]}-{pages_used[-1]} "
+                f"({len(retrieved)} excerpts, ~{est_tokens:,} tokens)"
+            )
         if helpful_examples:
             st.caption(f"Reusing {len(helpful_examples)} previously 👍-rated similar answer(s) as a guide.")
         placeholder = st.empty()
