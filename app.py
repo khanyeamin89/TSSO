@@ -25,9 +25,12 @@ per minute.
 Get a free API key (no credit card) at https://aistudio.google.com/app/apikey
 """
 
+import io
 import os
 import re
 import streamlit as st
+import streamlit.components.v1 as components
+import pandas as pd
 from google import genai
 from google.genai import types
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -59,10 +62,39 @@ Rules:
 - If the excerpts don't contain the answer, say so plainly -- don't guess,
   and mention that the relevant section may not have been retrieved (the
   user can try rephrasing the question to help retrieval find it).
-- Quote short phrases only when exact wording matters (e.g. a limit value
-  or defined term); otherwise explain in your own words.
 - Be precise with numbers, units, and parameter names -- this is a nuclear
   safety document and accuracy matters.
+
+How to write the answer (plain-language style):
+- Explain things in your OWN words, the way you'd explain it to an
+  intelligent but non-specialist reader. Do NOT lift whole sentences
+  verbatim from the document -- paraphrase, and spell out what a rule or
+  number actually MEANS in practice, not just what it says.
+- Quote short phrases (a few words) only when exact wording genuinely
+  matters, e.g. a defined term or a precise limit value.
+- Prefer short paragraphs, plain vocabulary, and bullet points over dense
+  technical prose. If a term is jargon, briefly say what it means the
+  first time you use it.
+- After explaining, you may add one short "In short:" takeaway line if it
+  helps the reader.
+
+Diagrams and charts (use only when they genuinely help):
+- If the answer describes a process, sequence of steps, a hierarchy, or
+  how parts of a system relate to each other, you may include a small
+  diagram as a fenced code block labeled ```mermaid```, using valid
+  Mermaid syntax (e.g. flowchart TD / graph TD, or sequenceDiagram).
+- If the answer compares several related numbers (e.g. limits for
+  different parameters, values across categories or conditions), you may
+  include a fenced code block labeled ```chart``` containing simple CSV
+  data with a header row, for example:
+  ```chart
+  Parameter,Value
+  Max Pressure (MPa),10
+  Max Temperature (C),25
+  ```
+- Only include ONE diagram or chart if it truly clarifies the answer --
+  do not add one to every response, and never invent numbers that aren't
+  in the excerpts.
 """
 
 # --------------------------------------------------------------------------
@@ -157,6 +189,62 @@ def build_contents(excerpt_text: str, chat_history: list[dict], question: str) -
 
 
 # --------------------------------------------------------------------------
+# Rendering: turn ```mermaid``` / ```chart``` fenced blocks in the model's
+# answer into an actual diagram / bar chart instead of raw text.
+# --------------------------------------------------------------------------
+
+_VISUAL_BLOCK_RE = re.compile(r"```(mermaid|chart)\n(.*?)```", re.DOTALL)
+
+
+def render_mermaid(code: str, height: int = 420) -> None:
+    """Render a Mermaid diagram using mermaid.js via a components.html iframe."""
+    html = f"""
+    <div class="mermaid">
+    {code}
+    </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+    <script>
+        mermaid.initialize({{ startOnLoad: true, theme: "neutral" }});
+    </script>
+    """
+    components.html(html, height=height, scrolling=True)
+
+
+def render_chart(csv_text: str) -> None:
+    """Render a small ```chart``` CSV block (header + rows) as a bar chart."""
+    try:
+        df = pd.read_csv(io.StringIO(csv_text.strip()))
+        if df.shape[1] >= 2:
+            df = df.set_index(df.columns[0])
+            st.bar_chart(df)
+        else:
+            st.code(csv_text.strip())
+    except Exception:
+        st.code(csv_text.strip())
+
+
+def render_answer(text: str) -> None:
+    """Split the model's answer on ```mermaid```/```chart``` fenced blocks and
+    render each part appropriately (markdown text, diagram, or chart)."""
+    parts = _VISUAL_BLOCK_RE.split(text)
+    idx, n = 0, len(parts)
+    while idx < n:
+        if idx % 3 == 0:
+            segment = parts[idx]
+            if segment and segment.strip():
+                st.markdown(segment)
+            idx += 1
+        else:
+            tag = parts[idx]
+            content = parts[idx + 1] if idx + 1 < n else ""
+            if tag == "mermaid":
+                render_mermaid(content)
+            elif tag == "chart":
+                render_chart(content)
+            idx += 2
+
+
+# --------------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------------
 
@@ -200,7 +288,10 @@ if "chat_history" not in st.session_state:
 
 for turn in st.session_state["chat_history"]:
     with st.chat_message(turn["role"]):
-        st.markdown(turn["content"])
+        if turn["role"] == "assistant":
+            render_answer(turn["content"])
+        else:
+            st.markdown(turn["content"])
 
 question = st.chat_input("Ask a question about the document...")
 
@@ -250,7 +341,11 @@ if question:
                 if chunk.text:
                     answer_text += chunk.text
                     placeholder.markdown(answer_text + "▌")
-            placeholder.markdown(answer_text)
+            # Streaming is done -- clear the raw placeholder and render the
+            # final answer properly (turns any ```mermaid``` / ```chart```
+            # blocks into an actual diagram or bar chart).
+            placeholder.empty()
+            render_answer(answer_text)
         except Exception as e:
             answer_text = f"Error calling the Gemini API: {e}"
             placeholder.error(answer_text)
