@@ -43,6 +43,7 @@ import streamlit.components.v1 as components
 import pandas as pd
 from google import genai
 from google.genai import types
+from groq import Groq
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -84,6 +85,22 @@ RETRY_BACKOFF_SECONDS = 2    # doubles each retry: 2s, 4s, ...
 SUPABASE_TABLE = "qa_chat_messages"       # see supabase_schema.sql
 SUPABASE_FEEDBACK_TABLE = "qa_feedback"   # thumbs-up/down learning signal, see supabase_schema.sql
 FEEDBACK_EXAMPLES_K = 2                   # how many past 👍 answers to reuse as style/accuracy examples
+
+# --------------------------------------------------------------------------
+# Fallback provider: Groq (free, no card, OpenAI-compatible). Used ONLY when
+# Gemini itself reports a quota/overload error after retrying -- i.e. an
+# automatic "use whichever is available" path, not a primary switch. Groq's
+# free tier has a much higher requests-per-minute ceiling than Gemini's free
+# tier, but a much SMALLER tokens-per-minute ceiling (6,000 TPM vs Gemini's
+# 250,000), so the fallback path retrieves fewer/smaller excerpts -- it
+# trades a bit of document coverage for actually getting an answer through.
+# Quality/citation discipline may differ slightly from Gemini since this is
+# a different (open-weights) model -- flagged clearly in the UI when used.
+GROQ_MODEL = "llama-3.3-70b-versatile"
+GROQ_TOP_K_CHUNKS = 3
+GROQ_MAX_EXCERPT_TOKENS = 3000
+GROQ_MAX_OUTPUT_TOKENS = 1200
+GROQ_MAX_RETRIES = 2
 
 SYSTEM_PROMPT = f"""You are a careful technical assistant answering questions \
 about a single reference document: {DOCUMENT_TITLE}.
@@ -260,6 +277,7 @@ def retrieve_chunks(
     top_k: int = TOP_K_CHUNKS,
     word_weight: float = 0.7,
     char_weight: float = 0.3,
+    max_excerpt_tokens: int = MAX_EXCERPT_TOKENS,
 ):
     """Return the top_k chunks most relevant to the query, sorted back into
     page order (so the excerpt reads coherently top-to-bottom). Combines
@@ -277,11 +295,11 @@ def retrieve_chunks(
 
     # Enforce the token budget: walk the list in relevance order (most
     # relevant first) and keep adding chunks until the next one would push
-    # the estimated total over MAX_EXCERPT_TOKENS. Always keep at least the
-    # single best chunk, even if it alone is large, so a question never
-    # comes back completely empty-handed.
+    # the estimated total over the budget. Always keep at least the single
+    # best chunk, even if it alone is large, so a question never comes back
+    # completely empty-handed.
     selected = []
-    budget_chars = MAX_EXCERPT_TOKENS * CHARS_PER_TOKEN_ESTIMATE
+    budget_chars = max_excerpt_tokens * CHARS_PER_TOKEN_ESTIMATE
     used_chars = 0
     for chunk in ranked:
         chunk_chars = len(chunk["text"])
@@ -331,6 +349,67 @@ def is_error_message(text: str) -> bool:
     return text.startswith("Sorry, the Gemini API is temporarily overloaded") or text.startswith(
         "Error calling the Gemini API:"
     )
+
+
+def get_groq_api_key() -> str | None:
+    key = None
+    try:
+        key = st.secrets.get("GROQ_API_KEY", None)
+    except Exception:
+        key = None
+    if not key:
+        key = os.environ.get("GROQ_API_KEY")
+    if not key:
+        key = st.session_state.get("manual_groq_key")
+    return key
+
+
+def stream_groq_answer(
+    api_key: str,
+    excerpt_text: str,
+    chat_history: list[dict],
+    question: str,
+    helpful_examples: list[dict] | None,
+):
+    """Stream an answer from Groq's OpenAI-compatible chat API, reusing the
+    same SYSTEM_PROMPT and excerpt/example format as the Gemini path so
+    behavior (page citations, outside-knowledge labeling) stays consistent.
+    Yields text deltas."""
+    client = Groq(api_key=api_key)
+
+    examples_block = ""
+    if helpful_examples:
+        rendered = "\n\n".join(
+            f"Q: {e['question']}\nA: {e['answer']}" for e in helpful_examples
+        )
+        examples_block = (
+            "Previously confirmed helpful (👍) answers to similar questions -- "
+            "use these only as a style/consistency guide, the excerpts below "
+            f"are still the source of truth:\n\n{rendered}\n\n"
+        )
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    for turn in chat_history:
+        role = "assistant" if turn["role"] == "assistant" else "user"
+        messages.append({"role": role, "content": turn["content"]})
+    messages.append(
+        {
+            "role": "user",
+            "content": f"{examples_block}Relevant excerpts from the document:\n\n{excerpt_text}\n\n"
+            f"Question: {question}",
+        }
+    )
+
+    stream = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        max_tokens=GROQ_MAX_OUTPUT_TOKENS,
+        stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content if chunk.choices else None
+        if delta:
+            yield delta
 
 
 def get_api_key() -> str | None:
@@ -641,6 +720,24 @@ with st.sidebar:
     else:
         st.success("API key loaded.")
 
+    groq_api_key = get_groq_api_key()
+    with st.expander("⚡ Groq fallback (optional)", expanded=not groq_api_key):
+        st.caption(
+            "If Gemini hits a rate limit, the app automatically retries the "
+            "same question through Groq (free, no card, much higher "
+            "requests/minute) instead of just failing. Answers via fallback "
+            "are clearly labeled, and Groq uses a different (open-weights) "
+            "model, so citation precision may vary slightly."
+        )
+        if groq_api_key:
+            st.success("Groq fallback is active.")
+        else:
+            st.markdown("Get a free key at [console.groq.com/keys](https://console.groq.com/keys).")
+            manual_groq_key = st.text_input("Enter your Groq API key", type="password", key="groq_key_input")
+            if manual_groq_key:
+                st.session_state["manual_groq_key"] = manual_groq_key
+                groq_api_key = manual_groq_key
+
     st.divider()
     st.session_state["fast_mode"] = st.toggle(
         "⚡ Fast mode",
@@ -825,7 +922,43 @@ if question:
                 else:
                     break
 
-        if last_error is not None:
+        # Gemini failed after retries -- automatically try Groq instead of
+        # just giving up, if a Groq key is configured and the failure was
+        # the kind a different provider could plausibly route around
+        # (quota/overload/internal, not e.g. a bad Gemini API key).
+        used_groq_fallback = False
+        if last_error is not None and groq_api_key and classify_api_error(last_error) != "other":
+            placeholder.info("Gemini is unavailable right now -- trying Groq instead...")
+            groq_retrieved = retrieve_chunks(
+                index, search_query, top_k=GROQ_TOP_K_CHUNKS, max_excerpt_tokens=GROQ_MAX_EXCERPT_TOKENS
+            )
+            groq_excerpt_text = (
+                "\n\n---\n\n".join(c["text"] for c in groq_retrieved)
+                if groq_retrieved
+                else excerpt_text
+            )
+            for groq_attempt in range(1, GROQ_MAX_RETRIES + 1):
+                answer_text = ""
+                try:
+                    for delta in stream_groq_answer(
+                        groq_api_key, groq_excerpt_text, st.session_state["chat_history"], question, helpful_examples
+                    ):
+                        answer_text += delta
+                        placeholder.markdown(answer_text + "▌")
+                    placeholder.empty()
+                    st.caption("⚡ Answered via Groq (Llama 3.3 70B) -- Gemini was rate-limited/unavailable.")
+                    render_answer(answer_text)
+                    if groq_retrieved:
+                        pages_used = sorted({p for c in groq_retrieved for p in c["pages"]})
+                    last_error = None
+                    used_groq_fallback = True
+                    break
+                except Exception as groq_e:
+                    last_error = groq_e
+                    if groq_attempt < GROQ_MAX_RETRIES:
+                        time.sleep(RETRY_BACKOFF_SECONDS)
+
+        if last_error is not None and not used_groq_fallback:
             error_kind = classify_api_error(last_error)
             if error_kind == "quota":
                 answer_text = (
