@@ -98,8 +98,8 @@ FEEDBACK_EXAMPLES_K = 2                   # how many past 👍 answers to reuse 
 # a different (open-weights) model -- flagged clearly in the UI when used.
 GROQ_MODEL = "llama-3.3-70b-versatile"
 GROQ_TOP_K_CHUNKS = 3
-GROQ_MAX_EXCERPT_TOKENS = 3000
-GROQ_MAX_OUTPUT_TOKENS = 1200
+GROQ_MAX_EXCERPT_TOKENS = 30000
+GROQ_MAX_OUTPUT_TOKENS = 20000
 GROQ_MAX_RETRIES = 2
 
 SYSTEM_PROMPT = f"""You are a careful technical assistant answering questions \
