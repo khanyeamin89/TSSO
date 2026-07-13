@@ -65,7 +65,7 @@ CHUNK_STRIDE_PAGES = 2  # overlap of 1 page between consecutive chunks
 # it to generate before you see the full answer.
 TOP_K_CHUNKS = 8         # was 12 -- smaller prompt, faster first token
 MIN_SIMILARITY = 0.03    # below this combined score, a chunk is too weak to use
-MAX_OUTPUT_TOKENS = 8192 # was 4096 -- 4096 was cutting off longer/detailed answers
+MAX_OUTPUT_TOKENS = 6192 # was 4096 -- 4096 was cutting off longer/detailed answers
 
 # Hard cap on the RETRIEVED EXCERPT text sent per request, regardless of how
 # many chunks TOP_K_CHUNKS picks. Some page ranges (dense tables, protocol
@@ -75,7 +75,7 @@ MAX_OUTPUT_TOKENS = 8192 # was 4096 -- 4096 was cutting off longer/detailed answ
 # chat history, and output tokens, which is what was tripping the
 # "high demand" retry loop. ~4 chars/token is a safe rough estimate for
 # English/technical text (real tokenizer isn't available client-side).
-MAX_EXCERPT_TOKENS = 80000
+MAX_EXCERPT_TOKENS = 50000
 CHARS_PER_TOKEN_ESTIMATE = 4
 THINKING_LEVEL = "low"   # Gemini 3.x "thinking" budget: low = fast, minimal deliberation
 
