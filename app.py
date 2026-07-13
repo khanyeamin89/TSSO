@@ -44,6 +44,7 @@ import pandas as pd
 from google import genai
 from google.genai import types
 from groq import Groq
+from mistralai import Mistral
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 
@@ -65,7 +66,7 @@ CHUNK_STRIDE_PAGES = 2  # overlap of 1 page between consecutive chunks
 # it to generate before you see the full answer.
 TOP_K_CHUNKS = 8         # was 12 -- smaller prompt, faster first token
 MIN_SIMILARITY = 0.03    # below this combined score, a chunk is too weak to use
-MAX_OUTPUT_TOKENS = 6192 # was 4096 -- 4096 was cutting off longer/detailed answers
+MAX_OUTPUT_TOKENS = 8192 # was 4096 -- 4096 was cutting off longer/detailed answers
 
 # Hard cap on the RETRIEVED EXCERPT text sent per request, regardless of how
 # many chunks TOP_K_CHUNKS picks. Some page ranges (dense tables, protocol
@@ -75,7 +76,7 @@ MAX_OUTPUT_TOKENS = 6192 # was 4096 -- 4096 was cutting off longer/detailed answ
 # chat history, and output tokens, which is what was tripping the
 # "high demand" retry loop. ~4 chars/token is a safe rough estimate for
 # English/technical text (real tokenizer isn't available client-side).
-MAX_EXCERPT_TOKENS = 50000
+MAX_EXCERPT_TOKENS = 80000
 CHARS_PER_TOKEN_ESTIMATE = 4
 THINKING_LEVEL = "low"   # Gemini 3.x "thinking" budget: low = fast, minimal deliberation
 
@@ -101,6 +102,17 @@ GROQ_TOP_K_CHUNKS = 3
 GROQ_MAX_EXCERPT_TOKENS = 3000
 GROQ_MAX_OUTPUT_TOKENS = 2048
 GROQ_MAX_RETRIES = 2
+
+# Third-tier fallback: Mistral Large. Independent free quota from both
+# Gemini and Groq (real redundancy), and generally stronger reasoning than
+# Groq's open-weights Llama for a dense technical document (better quality).
+# Its free "Experiment" tier trades that for a very low 2 RPM -- fine here
+# since it's only ever reached after BOTH Gemini and Groq have failed.
+MISTRAL_MODEL = "mistral-large-latest"
+MISTRAL_TOP_K_CHUNKS = 4
+MISTRAL_MAX_EXCERPT_TOKENS = 6000
+MISTRAL_MAX_OUTPUT_TOKENS = 3000
+MISTRAL_MAX_RETRIES = 2
 
 SYSTEM_PROMPT = f"""You are a careful technical assistant answering questions \
 about a single reference document: {DOCUMENT_TITLE}.
@@ -375,8 +387,40 @@ def stream_groq_answer(
     same SYSTEM_PROMPT and excerpt/example format as the Gemini path so
     behavior (page citations, outside-knowledge labeling) stays consistent.
     Yields text deltas."""
+    messages = _build_provider_messages(excerpt_text, chat_history, question, helpful_examples)
     client = Groq(api_key=api_key)
+    stream = client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=messages,
+        max_tokens=GROQ_MAX_OUTPUT_TOKENS,
+        stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content if chunk.choices else None
+        if delta:
+            yield delta
 
+
+def get_mistral_api_key() -> str | None:
+    key = None
+    try:
+        key = st.secrets.get("MISTRAL_API_KEY", None)
+    except Exception:
+        key = None
+    if not key:
+        key = os.environ.get("MISTRAL_API_KEY")
+    if not key:
+        key = st.session_state.get("manual_mistral_key")
+    return key
+
+
+def _build_provider_messages(
+    excerpt_text: str, chat_history: list[dict], question: str, helpful_examples: list[dict] | None
+) -> list[dict]:
+    """Shared OpenAI-style message list builder for the Groq/Mistral
+    fallback paths (same system prompt, excerpt block, and helpful-example
+    format as the Gemini path, so behavior stays consistent across
+    providers)."""
     examples_block = ""
     if helpful_examples:
         rendered = "\n\n".join(
@@ -399,17 +443,29 @@ def stream_groq_answer(
             f"Question: {question}",
         }
     )
+    return messages
 
-    stream = client.chat.completions.create(
-        model=GROQ_MODEL,
+
+def stream_mistral_answer(
+    api_key: str,
+    excerpt_text: str,
+    chat_history: list[dict],
+    question: str,
+    helpful_examples: list[dict] | None,
+):
+    """Stream an answer from Mistral Large. Yields text deltas."""
+    messages = _build_provider_messages(excerpt_text, chat_history, question, helpful_examples)
+    client = Mistral(api_key=api_key)
+    stream = client.chat.stream(
+        model=MISTRAL_MODEL,
         messages=messages,
-        max_tokens=GROQ_MAX_OUTPUT_TOKENS,
-        stream=True,
+        max_tokens=MISTRAL_MAX_OUTPUT_TOKENS,
     )
-    for chunk in stream:
-        delta = chunk.choices[0].delta.content if chunk.choices else None
-        if delta:
-            yield delta
+    with stream as event_stream:
+        for event in event_stream:
+            delta = event.data.choices[0].delta.content if event.data.choices else None
+            if delta:
+                yield delta
 
 
 def get_api_key() -> str | None:
@@ -738,6 +794,26 @@ with st.sidebar:
                 st.session_state["manual_groq_key"] = manual_groq_key
                 groq_api_key = manual_groq_key
 
+    mistral_api_key = get_mistral_api_key()
+    with st.expander("🧠 Mistral fallback (optional, 3rd tier)", expanded=False):
+        st.caption(
+            "If BOTH Gemini and Groq fail, the app tries once more through "
+            "Mistral Large -- an independent free quota (real redundancy) "
+            "and generally stronger reasoning than Groq's open-weights model "
+            "for a dense technical document. Its free tier is very slow "
+            "per-minute, which is fine since it's a last resort."
+        )
+        if mistral_api_key:
+            st.success("Mistral fallback is active.")
+        else:
+            st.markdown("Get a free key at [console.mistral.ai](https://console.mistral.ai/).")
+            manual_mistral_key = st.text_input(
+                "Enter your Mistral API key", type="password", key="mistral_key_input"
+            )
+            if manual_mistral_key:
+                st.session_state["manual_mistral_key"] = manual_mistral_key
+                mistral_api_key = manual_mistral_key
+
     st.divider()
     st.session_state["fast_mode"] = st.toggle(
         "⚡ Fast mode",
@@ -752,10 +828,15 @@ with st.sidebar:
     st.divider()
     index = build_index()
     active_model_label = FAST_MODEL if st.session_state.get("fast_mode") else MODEL
+    chain = [active_model_label]
+    if groq_api_key:
+        chain.append(GROQ_MODEL)
+    if mistral_api_key:
+        chain.append(MISTRAL_MODEL)
     st.markdown(
-        "**Model:** `{}`\n\n"
+        "**Model chain:** `{}`\n\n"
         "**Document:** {} pages, indexed into {} searchable chunks.".format(
-            active_model_label, index["num_pages"], len(index["chunks"])
+            " → ".join(chain), index["num_pages"], len(index["chunks"])
         )
     )
     st.caption(
@@ -950,11 +1031,11 @@ if question:
                 else:
                     break
 
-        # Gemini failed after retries -- automatically try Groq instead of
-        # just giving up, if a Groq key is configured and the failure was
-        # the kind a different provider could plausibly route around
+        # Gemini failed after retries -- automatically try Groq, then Mistral,
+        # instead of just giving up, for any key that's configured and any
+        # failure kind a different provider could plausibly route around
         # (quota/overload/internal, not e.g. a bad Gemini API key).
-        used_groq_fallback = False
+        used_fallback_provider = False
         if last_error is not None and groq_api_key and classify_api_error(last_error) != "other":
             placeholder.info("Gemini is unavailable right now -- trying Groq instead...")
             groq_retrieved = retrieve_chunks(
@@ -979,14 +1060,56 @@ if question:
                     if groq_retrieved:
                         pages_used = sorted({p for c in groq_retrieved for p in c["pages"]})
                     last_error = None
-                    used_groq_fallback = True
+                    used_fallback_provider = True
                     break
                 except Exception as groq_e:
                     last_error = groq_e
                     if groq_attempt < GROQ_MAX_RETRIES:
                         time.sleep(RETRY_BACKOFF_SECONDS)
 
-        if last_error is not None and not used_groq_fallback:
+        # Groq also failed (or wasn't configured) -- last resort: Mistral
+        # Large, on an entirely independent free quota.
+        if (
+            last_error is not None
+            and not used_fallback_provider
+            and mistral_api_key
+            and classify_api_error(last_error) != "other"
+        ):
+            placeholder.info("Groq is also unavailable right now -- trying Mistral instead...")
+            mistral_retrieved = retrieve_chunks(
+                index, search_query, top_k=MISTRAL_TOP_K_CHUNKS, max_excerpt_tokens=MISTRAL_MAX_EXCERPT_TOKENS
+            )
+            mistral_excerpt_text = (
+                "\n\n---\n\n".join(c["text"] for c in mistral_retrieved)
+                if mistral_retrieved
+                else excerpt_text
+            )
+            for mistral_attempt in range(1, MISTRAL_MAX_RETRIES + 1):
+                answer_text = ""
+                try:
+                    for delta in stream_mistral_answer(
+                        mistral_api_key,
+                        mistral_excerpt_text,
+                        st.session_state["chat_history"],
+                        question,
+                        helpful_examples,
+                    ):
+                        answer_text += delta
+                        placeholder.markdown(answer_text + "▌")
+                    placeholder.empty()
+                    st.caption("🧠 Answered via Mistral Large -- Gemini and Groq were both unavailable.")
+                    render_answer(answer_text)
+                    if mistral_retrieved:
+                        pages_used = sorted({p for c in mistral_retrieved for p in c["pages"]})
+                    last_error = None
+                    used_fallback_provider = True
+                    break
+                except Exception as mistral_e:
+                    last_error = mistral_e
+                    if mistral_attempt < MISTRAL_MAX_RETRIES:
+                        time.sleep(RETRY_BACKOFF_SECONDS)
+
+        if last_error is not None and not used_fallback_provider:
             error_kind = classify_api_error(last_error)
             if error_kind == "quota":
                 answer_text = (
