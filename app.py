@@ -595,7 +595,7 @@ if question:
                     contents=contents,
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM_PROMPT,
-                        max_output_tokens=50000,
+                        max_output_tokens=80000,
                     ),
                 )
                 for chunk in stream:
