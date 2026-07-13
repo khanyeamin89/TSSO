@@ -295,12 +295,34 @@ def retrieve_chunks(
     return selected
 
 
-def is_transient_api_error(e: Exception) -> bool:
-    """True for errors worth retrying automatically: server overload (503),
-    rate limiting (429), or generic backend hiccups (500) -- as opposed to
-    e.g. a bad API key, which retrying won't fix."""
+def classify_api_error(e: Exception) -> str:
+    """Classify an API exception so the UI can show something actionable
+    instead of one generic 'high demand' message for every case:
+    - 'quota'     : 429 / RESOURCE_EXHAUSTED -- YOUR project hit its RPM/TPM/
+                    RPD limit. Waiting a bit helps; asking less often helps
+                    more. Not Google being 'busy'.
+    - 'overload'  : 503 / UNAVAILABLE -- Google's backend is overloaded.
+                    Genuinely not your fault; retrying is the right move.
+    - 'internal'  : 500 / INTERNAL -- generic backend hiccup, also worth
+                    retrying.
+    - 'other'     : not automatically retryable (bad key, bad model name,
+                    malformed request, etc).
+    """
     msg = str(e)
-    return any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL"))
+    if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+        return "quota"
+    if "503" in msg or "UNAVAILABLE" in msg:
+        return "overload"
+    if "500" in msg or "INTERNAL" in msg:
+        return "internal"
+    return "other"
+
+
+def is_transient_api_error(e: Exception) -> bool:
+    """True for errors worth retrying automatically (quota/overload/internal)
+    -- as opposed to e.g. a bad API key or bad model name, which retrying
+    won't fix."""
+    return classify_api_error(e) != "other"
 
 
 def is_error_message(text: str) -> bool:
@@ -783,25 +805,47 @@ if question:
                 break
             except Exception as e:
                 last_error = e
-                if attempt < MAX_API_RETRIES and is_transient_api_error(e):
+                error_kind = classify_api_error(e)
+                if attempt < MAX_API_RETRIES and error_kind != "other":
                     wait_seconds = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
-                    placeholder.info(
-                        f"Gemini is under high demand right now -- retrying in "
-                        f"{wait_seconds}s (attempt {attempt}/{MAX_API_RETRIES})..."
-                    )
+                    if error_kind == "quota":
+                        retry_msg = (
+                            f"Rate/quota limit hit on this project (429) -- retrying in "
+                            f"{wait_seconds}s (attempt {attempt}/{MAX_API_RETRIES})... "
+                            "This means requests are going out faster than your tier "
+                            "allows, not that Google is busy."
+                        )
+                    else:
+                        retry_msg = (
+                            f"Gemini's backend is temporarily overloaded -- retrying in "
+                            f"{wait_seconds}s (attempt {attempt}/{MAX_API_RETRIES})..."
+                        )
+                    placeholder.info(retry_msg)
                     time.sleep(wait_seconds)
                 else:
                     break
 
         if last_error is not None:
-            if is_transient_api_error(last_error):
+            error_kind = classify_api_error(last_error)
+            if error_kind == "quota":
                 answer_text = (
-                    "Sorry, the Gemini API is temporarily overloaded and didn't "
-                    "respond after a few tries. This is usually short-lived -- "
-                    "please try asking again in a moment."
+                    "Rate/quota limit: this project has hit its Gemini API request "
+                    "or token limit (429 RESOURCE_EXHAUSTED) and didn't recover after "
+                    "a few retries. Check the live limits for this project/key at "
+                    "aistudio.google.com/rate-limit -- on the free tier this is often "
+                    "the requests-per-minute cap (as low as 5-15 RPM depending on the "
+                    "model), which a handful of quick questions in a row can trip."
+                )
+            elif error_kind in ("overload", "internal"):
+                answer_text = (
+                    "Sorry, the Gemini API backend is temporarily overloaded and didn't "
+                    "respond after a few tries. This is usually short-lived and on "
+                    "Google's side -- please try asking again in a moment."
                 )
             else:
                 answer_text = f"Error calling the Gemini API: {last_error}"
+            with st.expander("Technical details"):
+                st.code(f"{type(last_error).__name__}: {last_error}")
             placeholder.error(answer_text)
 
         if last_error is None and not is_error_message(answer_text):
