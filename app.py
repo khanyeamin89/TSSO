@@ -22,12 +22,20 @@ question. Retrieval keeps each request small (a few thousand tokens),
 so you comfortably stay inside the free tier and can ask many questions
 per minute.
 
+Chat history is persisted in Supabase (Postgres) so it survives page
+reloads and app restarts. Set SUPABASE_URL and SUPABASE_KEY in
+.streamlit/secrets.toml (or as environment variables) -- see
+supabase_schema.sql for the table this app expects. If those aren't
+set, the app still works, it just keeps history only in memory for the
+current browser tab.
+
 Get a free API key (no credit card) at https://aistudio.google.com/app/apikey
 """
 
 import io
 import os
 import re
+import uuid
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
@@ -47,6 +55,8 @@ DOCUMENT_TITLE = "RPR.0534.1.0.BN.DZ0001 -- Technical Specification of Safe Oper
 CHUNK_SIZE_PAGES = 3   # pages per chunk
 CHUNK_STRIDE_PAGES = 2  # overlap of 1 page between consecutive chunks
 TOP_K_CHUNKS = 12       # how many chunks to retrieve per question
+
+SUPABASE_TABLE = "qa_chat_messages"  # see supabase_schema.sql
 
 SYSTEM_PROMPT = f"""You are a careful technical assistant answering questions \
 about a single reference document: {DOCUMENT_TITLE}.
@@ -163,6 +173,101 @@ def get_api_key() -> str | None:
     return key
 
 
+def _get_secret(name: str) -> str | None:
+    """Look up a config value in st.secrets first, then env vars."""
+    value = None
+    try:
+        value = st.secrets.get(name, None)
+    except Exception:
+        value = None
+    if not value:
+        value = os.environ.get(name)
+    return value
+
+
+@st.cache_resource(show_spinner=False)
+def get_supabase_client():
+    """Create a Supabase client if SUPABASE_URL / SUPABASE_KEY are set.
+    Returns None (and the app falls back to in-memory-only history) if
+    they're missing or the client can't be created."""
+    url = _get_secret("SUPABASE_URL")
+    key = _get_secret("SUPABASE_KEY")
+    if not url or not key:
+        return None
+    try:
+        from supabase import create_client
+        return create_client(url, key)
+    except Exception:
+        return None
+
+
+def load_history_from_supabase(client, session_id: str) -> list[dict]:
+    """Load all messages for a conversation, oldest first."""
+    if client is None:
+        return []
+    try:
+        res = (
+            client.table(SUPABASE_TABLE)
+            .select("role, content")
+            .eq("session_id", session_id)
+            .order("created_at", desc=False)
+            .execute()
+        )
+        return [{"role": row["role"], "content": row["content"]} for row in res.data]
+    except Exception:
+        return []
+
+
+def save_message_to_supabase(client, session_id: str, role: str, content: str) -> None:
+    if client is None:
+        return
+    try:
+        client.table(SUPABASE_TABLE).insert(
+            {"session_id": session_id, "role": role, "content": content}
+        ).execute()
+    except Exception:
+        pass  # logging failures shouldn't break the chat
+
+
+def clear_session_in_supabase(client, session_id: str) -> None:
+    if client is None:
+        return
+    try:
+        client.table(SUPABASE_TABLE).delete().eq("session_id", session_id).execute()
+    except Exception:
+        pass
+
+
+def list_past_sessions(client, limit: int = 20) -> list[dict]:
+    """Return past conversations (excluding none in particular -- caller
+    filters out the current one), each as {session_id, first_question,
+    started_at}, most recently-started first."""
+    if client is None:
+        return []
+    try:
+        res = (
+            client.table(SUPABASE_TABLE)
+            .select("session_id, content, created_at")
+            .eq("role", "user")
+            .order("created_at", desc=False)
+            .limit(1000)
+            .execute()
+        )
+        first_seen = {}
+        for row in res.data:
+            sid = row["session_id"]
+            if sid not in first_seen:
+                first_seen[sid] = {
+                    "session_id": sid,
+                    "first_question": row["content"],
+                    "started_at": row["created_at"],
+                }
+        sessions = sorted(first_seen.values(), key=lambda s: s["started_at"], reverse=True)
+        return sessions[:limit]
+    except Exception:
+        return []
+
+
 def build_contents(excerpt_text: str, chat_history: list[dict], question: str) -> list[dict]:
     """Build the `contents` list for the API call. Unlike the whole-document
     approach, we send the (small) retrieved excerpt fresh with EVERY turn,
@@ -252,6 +357,16 @@ st.set_page_config(page_title="Document Q&A -- RPR.0534.1.0.BN.DZ0001", page_ico
 st.title("Document Q&A")
 st.caption(DOCUMENT_TITLE)
 
+supabase_client = get_supabase_client()
+
+# The conversation id lives in the URL (?session=...) so reloading the page
+# (or sharing the link) keeps you in the same conversation.
+if "session_id" not in st.session_state:
+    existing = st.query_params.get("session")
+    st.session_state["session_id"] = existing if existing else str(uuid.uuid4())
+    st.query_params["session"] = st.session_state["session_id"]
+session_id = st.session_state["session_id"]
+
 with st.sidebar:
     st.header("Setup")
     api_key = get_api_key()
@@ -279,12 +394,48 @@ with st.sidebar:
         "fast, and fits comfortably inside the free-tier quota."
     )
 
-    if st.button("Clear conversation"):
-        st.session_state["chat_history"] = []
-        st.rerun()
+    st.divider()
+    st.header("History")
+    if supabase_client is None:
+        st.caption(
+            "Conversation history isn't being saved permanently -- "
+            "SUPABASE_URL / SUPABASE_KEY aren't configured, so history "
+            "only lasts for this browser tab."
+        )
+    else:
+        st.caption(f"Conversation ID: `{session_id[:8]}`")
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("New chat", use_container_width=True):
+                new_id = str(uuid.uuid4())
+                st.session_state["session_id"] = new_id
+                st.session_state["chat_history"] = []
+                st.query_params["session"] = new_id
+                st.rerun()
+        with col2:
+            if st.button("Delete this chat", use_container_width=True):
+                clear_session_in_supabase(supabase_client, session_id)
+                st.session_state["chat_history"] = []
+                st.rerun()
+
+        past_sessions = [
+            s for s in list_past_sessions(supabase_client) if s["session_id"] != session_id
+        ]
+        if past_sessions:
+            with st.expander(f"Past conversations ({len(past_sessions)})"):
+                for s in past_sessions:
+                    q = s["first_question"].strip().replace("\n", " ")
+                    label = q[:60] + ("..." if len(q) > 60 else "")
+                    if st.button(label or "(untitled)", key=f"switch_{s['session_id']}"):
+                        st.session_state["session_id"] = s["session_id"]
+                        st.session_state["chat_history"] = load_history_from_supabase(
+                            supabase_client, s["session_id"]
+                        )
+                        st.query_params["session"] = s["session_id"]
+                        st.rerun()
 
 if "chat_history" not in st.session_state:
-    st.session_state["chat_history"] = []
+    st.session_state["chat_history"] = load_history_from_supabase(supabase_client, session_id)
 
 for turn in st.session_state["chat_history"]:
     with st.chat_message(turn["role"]):
@@ -316,6 +467,8 @@ if question:
             st.markdown(answer_text)
         st.session_state["chat_history"].append({"role": "user", "content": question})
         st.session_state["chat_history"].append({"role": "assistant", "content": answer_text})
+        save_message_to_supabase(supabase_client, session_id, "user", question)
+        save_message_to_supabase(supabase_client, session_id, "assistant", answer_text)
         st.stop()
 
     excerpt_text = "\n\n---\n\n".join(c["text"] for c in retrieved)
@@ -352,3 +505,5 @@ if question:
 
     st.session_state["chat_history"].append({"role": "user", "content": question})
     st.session_state["chat_history"].append({"role": "assistant", "content": answer_text})
+    save_message_to_supabase(supabase_client, session_id, "user", question)
+    save_message_to_supabase(supabase_client, session_id, "assistant", answer_text)
