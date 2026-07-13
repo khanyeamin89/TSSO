@@ -242,6 +242,14 @@ def is_transient_api_error(e: Exception) -> bool:
     return any(code in msg for code in ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED", "500", "INTERNAL"))
 
 
+def is_error_message(text: str) -> bool:
+    """True if an assistant message is one of our own API-failure messages
+    (as opposed to a normal answer, or the 'nothing relevant found' message)."""
+    return text.startswith("Sorry, the Gemini API is temporarily overloaded") or text.startswith(
+        "Error calling the Gemini API:"
+    )
+
+
 def get_api_key() -> str | None:
     key = None
     try:
@@ -519,14 +527,25 @@ with st.sidebar:
 if "chat_history" not in st.session_state:
     st.session_state["chat_history"] = load_history_from_supabase(supabase_client, session_id)
 
-for turn in st.session_state["chat_history"]:
+history = st.session_state["chat_history"]
+for i, turn in enumerate(history):
     with st.chat_message(turn["role"]):
         if turn["role"] == "assistant":
             render_answer(turn["content"])
+            is_last_turn = i == len(history) - 1
+            if is_last_turn and is_error_message(turn["content"]):
+                if st.button("🔄 Retry", key=f"retry_{session_id}_{i}"):
+                    failed_question = history[i - 1]["content"] if i > 0 else None
+                    if failed_question:
+                        st.session_state["chat_history"] = history[: i - 1]
+                        st.session_state["retry_question"] = failed_question
+                        st.rerun()
         else:
             st.markdown(turn["content"])
 
 question = st.chat_input("Ask a question about the document...")
+if not question:
+    question = st.session_state.pop("retry_question", None)
 
 if question:
     if not api_key:
