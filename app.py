@@ -52,7 +52,7 @@ except Exception:
     GROQ_AVAILABLE = False
 
 try:
-    from mistralai import Mistral
+    from mistralai.client import Mistral  # mistralai >=2.x no longer exposes Mistral at the package root
     MISTRAL_AVAILABLE = True
 except Exception:
     Mistral = None
